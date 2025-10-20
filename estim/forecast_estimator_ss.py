@@ -681,11 +681,20 @@ def compute_forecast_ss(
 
     notes: list[str] = []
     preprocessing_info: Dict[str, Any] = {}
+    user_messages: list[str] = []
+
+    user_messages.append(
+        f"Исходные данные: T={T} (CV={n_cv}, MV={n_mv})"
+    )
+    horizon_msg = f"Выбранный горизонт N: {N}"
     if capped:
         max_auto = getattr(p, "max_auto_N", None)
-        notes.append(
+        cap_note = (
             f"Горизонт N ограничен до {N} из-за max_auto_N={max_auto}."
         )
+        notes.append(cap_note)
+        horizon_msg += f" (ограничен max_auto_N={max_auto})"
+    user_messages.append(horizon_msg)
 
     # ── создаём единый предиктор (будем из него «доставать» open-loop)
     pred = PredictSSRolling(W=W, N_all=N_all, dt=p.dt,
@@ -700,6 +709,15 @@ def compute_forecast_ss(
                          u_past=None, warmup_len=None, assume_steady=not p.use_history)
 
     warmup_end_pos = N if (p.use_history and T > N) else 0
+    if p.use_history and T > N:
+        user_messages.append(
+            f"Прогрев по факту включён: warmup_end_pos={warmup_end_pos}."
+        )
+    else:
+        status = "включён" if p.use_history else "отключён"
+        user_messages.append(
+            f"Прогрев по факту {status}; warmup_end_pos={warmup_end_pos}."
+        )
 
     # warmup по факту — тоже через фильтрованный факт
     if p.use_history and T > N:
@@ -760,15 +778,27 @@ def compute_forecast_ss(
             "n_mv": int(n_mv),
             "N": int(N),
         })
-        notes.append(
+        auto_msg = (
             "rolling_sample_pct автоматически подобран: "
             f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step}). "
             f"Параметры задачи: CV={n_cv}, MV={n_mv}, N={N}."
         )
+        notes.append(auto_msg)
+        user_messages.append(
+            f"rolling_sample_pct (auto): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
+        )
     elif pct < 99.5:
-        notes.append(
+        manual_msg = (
             "rolling_sample_pct задан вручную: "
             f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step})."
+        )
+        notes.append(manual_msg)
+        user_messages.append(
+            f"rolling_sample_pct (manual): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
+        )
+    else:
+        user_messages.append(
+            "rolling_sample_pct: 100% (rolling на каждом такте)."
         )
 
     preprocessing_info["rolling_sampling"] = sampling_details
@@ -813,6 +843,26 @@ def compute_forecast_ss(
         iter_idx += 1
 
     # упаковываем rolling предсказания по горизонтам
+    sampling_details["actual_starts"] = int(len(sampled_t))
+    if rolling_available:
+        if sampled_t:
+            user_messages.append(
+                f"Rolling стартов рассчитано: {len(sampled_t)} (макс. t для rolling: {t_last})."
+            )
+        else:
+            user_messages.append(
+                "Rolling доступен, но подходящих стартов не найдено (проверьте warmup/N)."
+            )
+    else:
+        reason_text = rolling_reason or "без указания причины"
+        user_messages.append(f"Rolling отключён: {reason_text}")
+
+    if not rolling_available:
+        sampling_details["status"] = "unavailable"
+        sampling_details["reason"] = reason_text
+    else:
+        sampling_details["status"] = "available"
+
     if rolling_available:
         for k in range(1, N+1):
             mask = np.isfinite(preds_by_k[k]).all(axis=1)
@@ -864,6 +914,14 @@ def compute_forecast_ss(
             rolling_metrics_per_horizon = mph
             rolling_metrics_overall = pd.DataFrame(overall_rows).set_index("cv")
             rolling_R2_mean = float(rolling_metrics_overall["R2_%"].mean())
+
+    if notes:
+        for note in notes:
+            if note not in user_messages:
+                user_messages.append(note)
+
+    if user_messages:
+        print("\n".join(user_messages))
 
     return ForecastResult(
         df=df,

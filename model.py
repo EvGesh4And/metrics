@@ -165,6 +165,7 @@ class Model(Predict):
         df = data.copy()
         preprocessing: dict[str, object] = {}
         notes: list[str] = []
+        log_messages: list[str] = []
 
         if max_rows is not None:
             max_rows_val = int(max_rows)
@@ -180,6 +181,12 @@ class Model(Predict):
                 notes.append(
                     f"Данные усечены до последних {max_rows_val} строк (из {original_len})."
                 )
+                log_messages.append(
+                    f"Данные усечены до последних {len(df)} строк из {original_len} (max_rows={max_rows_val})."
+                )
+
+        if log_messages:
+            print("\n".join(log_messages))
 
         params = SSComputeParams(
             N=N,
