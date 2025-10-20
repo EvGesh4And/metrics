@@ -600,7 +600,7 @@ class SSComputeParams:
     alpha_bias: float = 1.0
     dt: float = 1.0
     tau_is_steps: bool = True
-    rolling_sample_pct: float = 100.0  # 0..100 — доля тактов, где считаем «веер»/метрики rolling
+    rolling_sample_pct: Optional[float] = None  # None ⇒ подобрать автоматически
     anchor_filter_len: int = 1         # 1 = без фильтра; >1 — MA по факту для якорения
     max_auto_N: Optional[int] = 200    # ограничение на авто-N при выборе 'max'
 
@@ -622,6 +622,31 @@ def _resolve_N(N_all: np.ndarray, N_req, max_auto: Optional[int]) -> tuple[int, 
     return n_val, capped
 
 
+def _auto_rolling_sample_pct(T: int, n_cv: int, n_mv: int, N: int) -> tuple[float, int]:
+    """Подбор rolling_sample_pct в зависимости от размера задачи."""
+
+    if T <= 0:
+        return 100.0, 0
+
+    # Для коротких рядов считаем каждый такт — метрики тогда построены на всей
+    # длине без дополнительных эвристик.
+    if T <= max(2_000, 5 * max(1, N)):
+        return 100.0, T
+
+    eff_horizon = max(1.0, N / 50.0)
+    eff_cv = max(1.0, n_cv / 4.0)
+    eff_mv = 1.0 + 0.2 * max(0.0, (n_mv / 6.0) - 1.0)
+    complexity = eff_horizon * eff_cv * eff_mv
+
+    # «Бюджет» стартов rolling, который хотим выдерживать даже на крупных
+    # задачах. При N≈200 это эквивалентно ~10 млн прогнозов CV.
+    base_budget = 50_000.0
+    approx_count = int(np.clip(base_budget / max(complexity, 1.0), 100, T))
+
+    pct = float(np.clip(100.0 * approx_count / max(T, 1), 100.0 / T, 100.0))
+    return pct, approx_count
+
+
 def compute_forecast_ss(
     W, N_all, df: pd.DataFrame, mv_cols: Iterable[str], cv_cols: Iterable[str],
     p: SSComputeParams = SSComputeParams()
@@ -635,14 +660,19 @@ def compute_forecast_ss(
     # проверки входа
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise ValueError("df пуст или не DataFrame.")
-    for c in list(mv_cols) + list(cv_cols):
+
+    mv_cols = list(mv_cols)
+    cv_cols = list(cv_cols)
+    for c in mv_cols + cv_cols:
         if c not in df.columns:
             raise ValueError(f"Колонка '{c}' отсутствует в df.")
 
     df = df.sort_index()
     U = df[mv_cols].to_numpy()
     Z = df[cv_cols].to_numpy()
-    T = len(df); n_cv = len(list(cv_cols))
+    T = len(df)
+    n_cv = len(cv_cols)
+    n_mv = len(mv_cols)
     if T < 3:
         raise ValueError(f"Слишком мало точек: T={T}, нужно ≥ 3.")
 
@@ -650,6 +680,7 @@ def compute_forecast_ss(
     N, capped = _resolve_N(N_all, p.N, getattr(p, "max_auto_N", None))
 
     notes: list[str] = []
+    preprocessing_info: Dict[str, Any] = {}
     if capped:
         max_auto = getattr(p, "max_auto_N", None)
         notes.append(
@@ -694,9 +725,53 @@ def compute_forecast_ss(
         rolling_reason = f"rolling невозможен: длина окна T={T} ≤ N={N}. Уменьшите N или расширьте окно данных."
 
     # прореживание
-    pct = float(np.clip(p.rolling_sample_pct, 0.0, 100.0))
+    pct_raw = getattr(p, "rolling_sample_pct", None)
+    if isinstance(pct_raw, str):
+        if pct_raw.strip().lower() == "auto":
+            pct_raw = None
+        else:
+            raise ValueError("rolling_sample_pct должен быть числом, None или 'auto'.")
+
+    approx_count = 0
+    pct_source = "manual"
+    if pct_raw is None:
+        pct, approx_count = _auto_rolling_sample_pct(T=T, n_cv=n_cv, n_mv=n_mv, N=N)
+        pct_source = "auto"
+    else:
+        pct = float(np.clip(pct_raw, 0.0, 100.0))
+        approx_count = int(T if pct >= 99.5 else max(1, round(T * pct / 100.0))) if pct > 0 else 1
+
+    pct = float(np.clip(pct, 0.0, 100.0))
     take_all = pct >= 99.5
     step = 1 if take_all else max(1, int(round(100.0 / max(pct, 1e-9))))
+
+    approx_step = 1 if take_all else max(1, int(round(T / max(approx_count, 1))))
+
+    sampling_details = {
+        "mode": pct_source,
+        "pct": pct,
+        "approx_starts": int(approx_count),
+        "approx_step": int(approx_step),
+    }
+    if pct_source == "auto":
+        sampling_details.update({
+            "T": int(T),
+            "n_cv": int(n_cv),
+            "n_mv": int(n_mv),
+            "N": int(N),
+        })
+        notes.append(
+            "rolling_sample_pct автоматически подобран: "
+            f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step}). "
+            f"Параметры задачи: CV={n_cv}, MV={n_mv}, N={N}."
+        )
+    elif pct < 99.5:
+        notes.append(
+            "rolling_sample_pct задан вручную: "
+            f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step})."
+        )
+
+    preprocessing_info["rolling_sampling"] = sampling_details
 
     rolling_pred_by_horizon: Dict[int, pd.DataFrame] = {}
     rolling_metrics_per_horizon = pd.DataFrame(columns=["sMAPE_%", "R2_%"])
@@ -792,8 +867,8 @@ def compute_forecast_ss(
 
     return ForecastResult(
         df=df,
-        mv_cols=list(mv_cols),
-        cv_cols=list(cv_cols),
+        mv_cols=mv_cols,
+        cv_cols=cv_cols,
         openloop_pred=openloop_pred,
         openloop_metrics_overall=openloop_metrics_overall,
         openloop_R2_mean=openloop_R2_mean,
@@ -806,4 +881,5 @@ def compute_forecast_ss(
         rolling_available=rolling_available,
         rolling_unavailable_reason=rolling_reason,
         notes=notes,
+        preprocessing=preprocessing_info,
     )
