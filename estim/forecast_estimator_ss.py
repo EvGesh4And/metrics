@@ -446,10 +446,44 @@ class ForecastResult:
         if not valid_starts:
             raise ValueError("В выбранном диапазоне нет валидных стартов для веера (учтите прогрев и горизонт N).")
 
-        step = max(1, int(fan_stride))
-        t_starts = valid_starts[::step]
-        if len(t_starts) > fan_max:
-            t_starts = t_starts[:fan_max]
+        valid_starts = sorted(set(int(p) for p in valid_starts))
+        stride = max(1, int(fan_stride))
+        limit = fan_max if fan_max is not None and fan_max > 0 else len(valid_starts)
+        if limit <= 0:
+            limit = len(valid_starts)
+        limit = min(limit, len(valid_starts))
+
+        spaced: list[int] = []
+        for pos in valid_starts:
+            if not spaced or (pos - spaced[-1]) >= stride:
+                spaced.append(pos)
+
+        if not spaced:
+            spaced = [valid_starts[0]]
+
+        if len(spaced) >= limit:
+            if len(spaced) > limit:
+                idx = np.linspace(0, len(spaced) - 1, limit, dtype=int)
+                t_starts = [spaced[i] for i in idx]
+            else:
+                t_starts = spaced
+        else:
+            # добираем недостающие старты из общего списка, равномерно распределяя
+            needed = limit - len(spaced)
+            remaining = [p for p in valid_starts if p not in spaced]
+            if remaining:
+                if needed >= len(remaining):
+                    spaced.extend(remaining)
+                else:
+                    idx = np.linspace(0, len(remaining) - 1, needed, dtype=int)
+                    spaced.extend(remaining[i] for i in idx)
+            t_starts = sorted(set(spaced))[:limit]
+
+        if show_messages:
+            print(
+                f"Веер построен по {len(t_starts)} стартам из {len(valid_starts)} доступных в диапазоне.",
+                flush=True,
+            )
 
         for cv in cv_to_plot:
             fig = go.Figure()
@@ -921,6 +955,10 @@ def compute_forecast_ss(
     df_eval = df.iloc[eval_from:]
     zhat_eval = openloop_pred.iloc[eval_from:]
 
+    _log(
+        f"→ Считаем метрики open-loop на {len(df_eval)} точках (начиная с t={eval_from})."
+    )
+
     rows = []
     for cv in cv_cols:
         sm, r2 = _compute_smape_r2(df_eval[cv].to_numpy(), zhat_eval[cv].to_numpy())
@@ -928,8 +966,20 @@ def compute_forecast_ss(
     openloop_metrics_overall = pd.DataFrame(rows).set_index("cv") if rows else pd.DataFrame()
     openloop_R2_mean = float(openloop_metrics_overall["R2_%"].mean()) if not openloop_metrics_overall.empty else np.nan
 
+    if openloop_metrics_overall.empty:
+        _log("Метрики open-loop: недостаточно точек после прогрева для расчёта.")
+    else:
+        _log(
+            "Метрики open-loop рассчитаны: "
+            f"средний R² ≈ {openloop_R2_mean:.2f}% по {len(openloop_metrics_overall)} CV."
+        )
+
     # ── метрики rolling: по sampled_t (тоже по сырому факту)
     if rolling_available and sampled_t:
+        _log(
+            "→ Считаем метрики rolling: "
+            f"{len(sampled_t)} стартов, горизонтов={N}."
+        )
         metrics_rows = []
         t_idx = np.array(sampled_t, dtype=int)
         for k in range(1, N+1):
@@ -957,6 +1007,16 @@ def compute_forecast_ss(
             rolling_metrics_per_horizon = mph
             rolling_metrics_overall = pd.DataFrame(overall_rows).set_index("cv")
             rolling_R2_mean = float(rolling_metrics_overall["R2_%"].mean())
+
+        if rolling_metrics_overall.empty:
+            _log("Метрики rolling: подходящих точек не набралось (проверьте горизонты/NaN).")
+        else:
+            _log(
+                "Метрики rolling рассчитаны: "
+                f"средний R² ≈ {rolling_R2_mean:.2f}% по {len(rolling_metrics_overall)} CV."
+            )
+    elif rolling_available and not sampled_t:
+        _log("Метрики rolling не считались: нет стартов в выборке.")
 
     if notes:
         for note in notes:
