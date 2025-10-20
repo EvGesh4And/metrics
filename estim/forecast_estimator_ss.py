@@ -461,29 +461,22 @@ class ForecastResult:
         if not spaced:
             spaced = [valid_starts[0]]
 
-        if len(spaced) >= limit:
-            if len(spaced) > limit:
-                idx = np.linspace(0, len(spaced) - 1, limit, dtype=int)
-                t_starts = [spaced[i] for i in idx]
-            else:
-                t_starts = spaced
+        if len(spaced) > limit:
+            idx = np.linspace(0, len(spaced) - 1, limit, dtype=int)
+            t_starts = [spaced[i] for i in idx]
         else:
-            # добираем недостающие старты из общего списка, равномерно распределяя
-            needed = limit - len(spaced)
-            remaining = [p for p in valid_starts if p not in spaced]
-            if remaining:
-                if needed >= len(remaining):
-                    spaced.extend(remaining)
-                else:
-                    idx = np.linspace(0, len(remaining) - 1, needed, dtype=int)
-                    spaced.extend(remaining[i] for i in idx)
-            t_starts = sorted(set(spaced))[:limit]
+            t_starts = spaced
 
         if show_messages:
-            print(
-                f"Веер построен по {len(t_starts)} стартам из {len(valid_starts)} доступных в диапазоне.",
-                flush=True,
+            msg = (
+                f"Веер построен по {len(t_starts)} стартам из {len(valid_starts)} доступных в диапазоне."
             )
+        if show_messages and len(t_starts) > 1:
+            diffs = np.diff(sorted(t_starts))
+            if len(diffs):
+                msg += f" Минимальный шаг между стартами: {int(diffs.min())}."
+        if show_messages:
+            print(msg, flush=True)
 
         for cv in cv_to_plot:
             fig = go.Figure()
