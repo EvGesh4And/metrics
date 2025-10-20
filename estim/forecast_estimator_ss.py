@@ -340,6 +340,7 @@ class ForecastResult:
         fan_max: int = 20,
         title_prefix: str = "Rolling",
         cv_list: Sequence[str] | None = None,
+        mv_list: Sequence[str] | None = None,
         max_points: int | None = 2_000,
         show_messages: bool = True,
     ):
@@ -347,9 +348,13 @@ class ForecastResult:
 
         Диапазон ``[start_pos : end_pos)`` обрабатывается аналогично
         :meth:`plot_openloop`. По умолчанию берутся последние ``max_points``
-        наблюдений и максимум 5 CV. Аргументы ``fan_stride`` и ``fan_max``
+        наблюдений и максимум 5 CV/MV. Аргументы ``fan_stride`` и ``fan_max``
         управляют прореживанием стартов rolling: например, ``fan_stride=200``
         и ``fan_max=10`` оставят каждый 200‑й старт, но не больше 10 штук.
+
+        ``mv_list`` позволяет дополнительно отрисовать интересующие MV на
+        отдельном графике (по умолчанию берутся первые 5), что помогает
+        сопоставить динамику управлений и фактических CV.
 
         Если в выбранном диапазоне стартов недостаточно (учитывая прогрев и
         горизонт ``N``), метод бросает ``ValueError`` с подсказкой. Это нормальное
@@ -389,6 +394,17 @@ class ForecastResult:
         if not cv_to_plot:
             raise ValueError("Нет CV для отображения (cv_list пуст).")
 
+        mv_all = list(self.mv_cols)
+        if mv_list is None:
+            mv_to_plot = mv_all[:5]
+            auto_mv = True
+        else:
+            mv_to_plot = [str(mv) for mv in mv_list]
+            missing_mv = [mv for mv in mv_to_plot if mv not in mv_all]
+            if missing_mv:
+                raise ValueError(f"Следующие MV отсутствуют в данных: {missing_mv}")
+            auto_mv = False
+
         dfw = self.df.iloc[s:e]
         L = len(dfw)
         x = np.arange(L)
@@ -402,6 +418,10 @@ class ForecastResult:
         if auto_cv and len(cv_all) > len(cv_to_plot) and show_messages:
             messages.append(
                 "Показаны только первые 5 CV. Передайте cv_list, чтобы указать другой набор."
+            )
+        if auto_mv and len(mv_all) > len(mv_to_plot) and show_messages and mv_to_plot:
+            messages.append(
+                "Показаны только первые 5 MV. Передайте mv_list, чтобы указать другой набор."
             )
         if messages:
             print("\n".join(messages))
@@ -466,6 +486,23 @@ class ForecastResult:
                 plot_bgcolor="rgba(0,0,0,0)"
             )
             fig.show()
+
+        if mv_to_plot:
+            fig_mv = go.Figure()
+            for mv in mv_to_plot:
+                fig_mv.add_trace(
+                    go.Scatter(x=x, y=dfw[mv], name=mv, mode="lines", line=dict(width=2))
+                )
+            fig_mv.update_layout(
+                title=f"{title_prefix}: MV  |  [{s}:{e})",
+                xaxis_title="Такт",
+                yaxis_title="MV",
+                width=1100,
+                height=420,
+                legend=dict(orientation="h", x=1, xanchor="right"),
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            fig_mv.show()
 
     def summary(self, digits: int = 1, top_n: int = 3, return_text: bool = False) -> str | None:
         """Текстовая сводка расчёта.
@@ -683,7 +720,13 @@ def compute_forecast_ss(
     preprocessing_info: Dict[str, Any] = {}
     user_messages: list[str] = []
 
-    user_messages.append(
+    def _log(msg: str, *, store: bool = True) -> None:
+        """Печатает сообщение сразу и при необходимости сохраняет его."""
+        if store:
+            user_messages.append(msg)
+        print(msg, flush=True)
+
+    _log(
         f"Исходные данные: T={T} (CV={n_cv}, MV={n_mv})"
     )
     horizon_msg = f"Выбранный горизонт N: {N}"
@@ -694,7 +737,7 @@ def compute_forecast_ss(
         )
         notes.append(cap_note)
         horizon_msg += f" (ограничен max_auto_N={max_auto})"
-    user_messages.append(horizon_msg)
+    _log(horizon_msg)
 
     # ── создаём единый предиктор (будем из него «доставать» open-loop)
     pred = PredictSSRolling(W=W, N_all=N_all, dt=p.dt,
@@ -710,12 +753,12 @@ def compute_forecast_ss(
 
     warmup_end_pos = N if (p.use_history and T > N) else 0
     if p.use_history and T > N:
-        user_messages.append(
+        _log(
             f"Прогрев по факту включён: warmup_end_pos={warmup_end_pos}."
         )
     else:
         status = "включён" if p.use_history else "отключён"
-        user_messages.append(
+        _log(
             f"Прогрев по факту {status}; warmup_end_pos={warmup_end_pos}."
         )
 
@@ -784,7 +827,7 @@ def compute_forecast_ss(
             f"Параметры задачи: CV={n_cv}, MV={n_mv}, N={N}."
         )
         notes.append(auto_msg)
-        user_messages.append(
+        _log(
             f"rolling_sample_pct (auto): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
         )
     elif pct < 99.5:
@@ -793,11 +836,11 @@ def compute_forecast_ss(
             f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step})."
         )
         notes.append(manual_msg)
-        user_messages.append(
+        _log(
             f"rolling_sample_pct (manual): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
         )
     else:
-        user_messages.append(
+        _log(
             "rolling_sample_pct: 100% (rolling на каждом такте)."
         )
 
@@ -846,16 +889,16 @@ def compute_forecast_ss(
     sampling_details["actual_starts"] = int(len(sampled_t))
     if rolling_available:
         if sampled_t:
-            user_messages.append(
+            _log(
                 f"Rolling стартов рассчитано: {len(sampled_t)} (макс. t для rolling: {t_last})."
             )
         else:
-            user_messages.append(
+            _log(
                 "Rolling доступен, но подходящих стартов не найдено (проверьте warmup/N)."
             )
     else:
         reason_text = rolling_reason or "без указания причины"
-        user_messages.append(f"Rolling отключён: {reason_text}")
+        _log(f"Rolling отключён: {reason_text}")
 
     if not rolling_available:
         sampling_details["status"] = "unavailable"
@@ -918,10 +961,7 @@ def compute_forecast_ss(
     if notes:
         for note in notes:
             if note not in user_messages:
-                user_messages.append(note)
-
-    if user_messages:
-        print("\n".join(user_messages))
+                _log(note)
 
     return ForecastResult(
         df=df,
