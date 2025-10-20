@@ -101,6 +101,8 @@ class Model(Predict):
         use_history: bool = False,
         rolling_sample_pct: float = 100.0,   # ← новый параметр (0..100)
         anchor_filter_len: int = 1,
+        max_rows: int | None = 10_000,
+        max_auto_N: int | None = 200,
     ):
         """
         Минимальный вызов: считает open-loop и rolling (без гейнов), без отрисовки.
@@ -112,6 +114,8 @@ class Model(Predict):
         N: 'max' | 'min' | int>0 — глобальный горизонт
         use_history: использовать ли прогрев по факту (warm-up)
         rolling_sample_pct: доля тактов (в %) для расчёта «веера»/метрик rolling
+        max_rows: автоматическое ограничение длины датасета (берём последние max_rows)
+        max_auto_N: ограничение для авто-выбора горизонта N (актуально при N='max')
         """
         # имена переменных берём из модели
         self.get_var_cols()
@@ -122,6 +126,25 @@ class Model(Predict):
         W = getattr(model, "W", None)
         N_all = getattr(model, "N_all", None)
 
+        df = data.copy()
+        preprocessing: dict[str, object] = {}
+        notes: list[str] = []
+
+        if max_rows is not None:
+            max_rows_val = int(max_rows)
+            if max_rows_val <= 0:
+                raise ValueError("max_rows должно быть положительным числом или None.")
+            if len(df) > max_rows_val:
+                original_len = len(df)
+                df = df.iloc[-max_rows_val:].copy()
+                preprocessing["rows"] = {
+                    "original": int(original_len),
+                    "used": int(len(df)),
+                }
+                notes.append(
+                    f"Данные усечены до последних {max_rows_val} строк (из {original_len})."
+                )
+
         params = SSComputeParams(
             N=N,
             use_history=use_history,
@@ -130,16 +153,21 @@ class Model(Predict):
             tau_is_steps=True,
             rolling_sample_pct=rolling_sample_pct,
             anchor_filter_len=anchor_filter_len,
+            max_auto_N=max_auto_N,
         )
 
         res = compute_forecast_ss(
             W=W,
             N_all=N_all,
-            df=data,
+            df=df,
             mv_cols=mv_cols,
             cv_cols=cv_cols,
             p=params,
         )
+        if notes:
+            res.notes.extend(notes)
+        if preprocessing:
+            res.preprocessing.update(preprocessing)
         return res
 
 
