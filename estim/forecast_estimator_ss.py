@@ -447,25 +447,23 @@ class ForecastResult:
             raise ValueError("В выбранном диапазоне нет валидных стартов для веера (учтите прогрев и горизонт N).")
 
         valid_starts = sorted(set(int(p) for p in valid_starts))
+
+        # valid_starts уже отсортированы, warm_len_local и L известны
         stride = max(1, int(fan_stride))
-        limit = fan_max if fan_max is not None and fan_max > 0 else len(valid_starts)
-        if limit <= 0:
-            limit = len(valid_starts)
-        limit = min(limit, len(valid_starts))
+        limit  = fan_max if fan_max else len(valid_starts)
 
-        spaced: list[int] = []
-        for pos in valid_starts:
-            if not spaced or (pos - spaced[-1]) >= stride:
-                spaced.append(pos)
+        # 1️⃣ Начинаем не с 0, а от конца прогрева
+        anchor = warm_len_local
 
-        if not spaced:
-            spaced = [valid_starts[0]]
+        # 2️⃣ Берём старты ≥ anchor и с шагом не меньше stride
+        starts = [p for p in valid_starts if p >= anchor]
+        filtered = []
+        for pos in starts:
+            if not filtered or (pos - filtered[-1]) >= stride:
+                filtered.append(pos)
 
-        if len(spaced) > limit:
-            idx = np.linspace(0, len(spaced) - 1, limit, dtype=int)
-            t_starts = [spaced[i] for i in idx]
-        else:
-            t_starts = spaced
+        # 3️⃣ Обрезаем по fan_max
+        t_starts = filtered[:limit]
 
         if show_messages:
             msg = (
