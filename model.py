@@ -99,19 +99,59 @@ class Model(Predict):
         data: pd.DataFrame,
         N: int | str = "max",
         use_history: bool = False,
-        rolling_sample_pct: float = 100.0,   # ← новый параметр (0..100)
+        rolling_sample_pct: float | None = None,
         anchor_filter_len: int = 1,
+        max_rows: int | None = None,
+        max_auto_N: int | None = 200,
     ):
-        """
-        Минимальный вызов: считает open-loop и rolling (без гейнов), без отрисовки.
-        Возвращает ForecastResult:
-        - res.plot_openloop(...)
-        - res.plot_rolling(...)
-        - res.summary(...)
-        Параметры:
-        N: 'max' | 'min' | int>0 — глобальный горизонт
-        use_history: использовать ли прогрев по факту (warm-up)
-        rolling_sample_pct: доля тактов (в %) для расчёта «веера»/метрик rolling
+        """Считает прогноз open-loop и rolling и возвращает :class:`ForecastResult`.
+
+        **Что происходит под капотом**
+
+        * Если ``max_rows`` задан и данных больше, чем ``max_rows``,
+          автоматически берутся последние ``max_rows`` строк. Информация об
+          усечении попадёт в ``ForecastResult.preprocessing`` и
+          ``ForecastResult.notes``.
+        * При ``N="max"`` горизонт не превышает ``max_auto_N``. Это защищает
+          от слишком длинных вееров на больших задачах. Фактическое значение
+          ``N`` можно посмотреть в ``result.N`` или в ``result.summary()``.
+        * ``rolling_sample_pct`` управляет прореживанием стартов rolling.
+          ``None`` включает автоматическую эвристику, которая учитывает длину
+          ряда, количество CV/MV и выбранный горизонт ``N``. Значение ``100``
+          означает расчёт веера на каждом такте.
+          Фактические параметры прореживания попадают в
+          ``result.preprocessing['rolling_sampling']`` и ``result.notes``.
+        * ``anchor_filter_len`` задаёт длину окна усреднения факта, которое
+          используется как якорь при шаге модели.
+
+        **Как использовать результат**
+
+        .. code-block:: python
+
+            res = model.estimate_forecast(df)
+            res.summary()                          # текстовая сводка
+            metrics = res.metrics_dict()           # словарь с метриками
+            res.plot_openloop(cv_list=["CV1"])    # график факт vs open-loop
+            res.plot_rolling(fan_stride=200)       # веер rolling
+            res.to_json(include_predictions=True)  # сериализация в json
+
+        Параметры
+        ---------
+        data : pandas.DataFrame
+            Исходные данные (колонки CV/MV должны совпадать с моделью).
+        N : {'max', 'min', int}, по умолчанию ``'max'``
+            Глобальный горизонт прогноза. Число > 0 — использовать как есть.
+        use_history : bool, по умолчанию ``False``
+            Управляет прогревом по факту (warm-up).
+        rolling_sample_pct : float или None, по умолчанию ``None``
+            Доля тактов (в процентах), на которых рассчитывается rolling.
+            ``None`` включает автоматический подбор доли.
+        anchor_filter_len : int, по умолчанию ``1``
+            Длина окна сглаживания факта при обновлении состояния модели.
+        max_rows : int или None, по умолчанию ``None``
+            Максимальное число строк данных. ``None`` — использовать все.
+        max_auto_N : int или None, по умолчанию ``200``
+            Ограничение на автоматически выбранный ``N`` при ``N='max'``.
         """
         # имена переменных берём из модели
         self.get_var_cols()
@@ -122,6 +162,32 @@ class Model(Predict):
         W = getattr(model, "W", None)
         N_all = getattr(model, "N_all", None)
 
+        df = data.copy()
+        preprocessing: dict[str, object] = {}
+        notes: list[str] = []
+        log_messages: list[str] = []
+
+        if max_rows is not None:
+            max_rows_val = int(max_rows)
+            if max_rows_val <= 0:
+                raise ValueError("max_rows должно быть положительным числом или None.")
+            if len(df) > max_rows_val:
+                original_len = len(df)
+                df = df.iloc[-max_rows_val:].copy()
+                preprocessing["rows"] = {
+                    "original": int(original_len),
+                    "used": int(len(df)),
+                }
+                notes.append(
+                    f"Данные усечены до последних {max_rows_val} строк (из {original_len})."
+                )
+                log_messages.append(
+                    f"Данные усечены до последних {len(df)} строк из {original_len} (max_rows={max_rows_val})."
+                )
+
+        if log_messages:
+            print("\n".join(log_messages))
+
         params = SSComputeParams(
             N=N,
             use_history=use_history,
@@ -130,16 +196,21 @@ class Model(Predict):
             tau_is_steps=True,
             rolling_sample_pct=rolling_sample_pct,
             anchor_filter_len=anchor_filter_len,
+            max_auto_N=max_auto_N,
         )
 
         res = compute_forecast_ss(
             W=W,
             N_all=N_all,
-            df=data,
+            df=df,
             mv_cols=mv_cols,
             cv_cols=cv_cols,
             p=params,
         )
+        if notes:
+            res.notes.extend(notes)
+        if preprocessing:
+            res.preprocessing.update(preprocessing)
         return res
 
 

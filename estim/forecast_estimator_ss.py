@@ -1,6 +1,8 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Union
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, Optional, Union, Any, Sequence
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -44,6 +46,19 @@ def _z_ma_inclusive(Z: np.ndarray, t: int, win: int) -> np.ndarray:
 
 @dataclass
 class ForecastResult:
+    """Результат расчёта прогноза ``Model.estimate_forecast``.
+
+    Экземпляр содержит исходные данные расчёта, подготовленные
+    предсказания и агрегированные метрики. Объект можно использовать
+    программно: сериализовать в ``dict``/``json`` и строить графики без
+    повторного запуска расчёта. Основные сценарии использования:
+
+    * ``result.summary()`` — компактный отчёт с ключевыми цифрами;
+    * ``result.metrics_dict()`` или ``result.to_json()`` — метрики в
+      машинном формате (например, чтобы сохранить в артефакты тестов);
+    * ``result.plot_openloop(...)`` и ``result.plot_rolling(...)`` —
+      интерактивные графики fact vs. forecast.
+    """
     # ────────────── данные расчёта ──────────────
     df: pd.DataFrame
     mv_cols: Iterable[str]
@@ -66,29 +81,204 @@ class ForecastResult:
     rolling_available: bool
     rolling_unavailable_reason: Optional[str] = None
 
-    # ----------------- ФАКТ vs OPEN-LOOP -----------------
-    def plot_openloop(self, start_pos: int | None = None, end_pos: int | None = None,
-                      title_prefix: str = "Open-loop"):
+    # ────────────── дополнительные сведения ──────────────
+    notes: list[str] = field(default_factory=list)
+    preprocessing: Dict[str, Any] = field(default_factory=dict)
+
+    # ----------------- сериализация -----------------
+    def metrics_dict(self) -> Dict[str, Any]:
+        """Возвращает словарь с основными метриками и служебной информацией.
+
+        Используйте метод, если нужно сравнивать разные версии модели или
+        зафиксировать метрики в юнит-/интеграционных тестах. Структура
+        словаря полностью JSON-совместима: ``json.dumps(result.metrics_dict())``
+        работает «из коробки».
         """
-        Факт vs open-loop на [start_pos : end_pos) (end_pos эксклюзивный).
-        Серая зона прогрева и «дырка» в прогнозе строятся по пересечению окна с [0:warmup_end_pos).
+
+        def _df_to_index_dict(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+            if df is None or df.empty:
+                return {}
+            return df.to_dict(orient="index")
+
+        def _df_to_hier_dict(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+            if df is None or df.empty:
+                return {}
+            return {
+                str(idx): row for idx, row in df.to_dict(orient="index").items()
+            }
+
+        def _nan_to_none(value: Any) -> Any:
+            if isinstance(value, (float, np.floating)) and np.isnan(value):
+                return None
+            return value
+
+        metrics: Dict[str, Any] = {
+            "N": int(self.N),
+            "warmup_end_pos": int(self.warmup_end_pos),
+            "rolling_available": bool(self.rolling_available),
+            "rolling_unavailable_reason": self.rolling_unavailable_reason,
+            "notes": list(self.notes),
+            "preprocessing": dict(self.preprocessing),
+            "openloop": {
+                "R2_mean": _nan_to_none(self.openloop_R2_mean),
+                "metrics_by_cv": _df_to_index_dict(self.openloop_metrics_overall),
+            },
+            "rolling": {
+                "R2_mean": _nan_to_none(self.rolling_R2_mean),
+                "metrics_by_cv": _df_to_index_dict(self.rolling_metrics_overall),
+                "metrics_per_horizon": _df_to_hier_dict(
+                    self.rolling_metrics_per_horizon
+                ),
+            },
+        }
+        return metrics
+
+    def to_dict(
+        self,
+        include_predictions: bool = False,
+        include_source: bool = False,
+        predictions_orient: str = "records",
+    ) -> Dict[str, Any]:
+        """Преобразует результат в словарь. Подходит для сериализации в JSON.
+
+        По умолчанию возвращает только метрики. Передайте ``include_source``
+        и/или ``include_predictions``, чтобы дополнительно получить исходные
+        данные и предсказания (удобно для экспорта в отчёты или проверки
+        регрессий).
+        """
+
+        result: Dict[str, Any] = {
+            "metrics": self.metrics_dict(),
+        }
+
+        if include_source:
+            result["data"] = self.df.reset_index().to_dict(orient=predictions_orient)
+
+        if include_predictions:
+            result["openloop_pred"] = self.openloop_pred.reset_index().to_dict(
+                orient=predictions_orient
+            )
+            result["rolling_pred_by_horizon"] = {
+                int(k): df.reset_index().to_dict(orient=predictions_orient)
+                for k, df in self.rolling_pred_by_horizon.items()
+            }
+
+        return result
+
+    def to_json(
+        self,
+        include_predictions: bool = False,
+        include_source: bool = False,
+        predictions_orient: str = "records",
+        **json_kwargs: Any,
+    ) -> str:
+        """Возвращает строку JSON с результатами расчёта.
+
+        Параметры ``include_predictions`` и ``include_source`` повторяют
+        аргументы :meth:`to_dict`. Дополнительные ``json_kwargs`` пробрасываются
+        в ``json.dumps`` (например, ``indent=2``).
+        """
+
+        payload = self.to_dict(
+            include_predictions=include_predictions,
+            include_source=include_source,
+            predictions_orient=predictions_orient,
+        )
+        return json.dumps(payload, ensure_ascii=False, **json_kwargs)
+
+    # ----------------- ФАКТ vs OPEN-LOOP -----------------
+    def plot_openloop(
+        self,
+        start_pos: int | None = None,
+        end_pos: int | None = None,
+        title_prefix: str = "Open-loop",
+        cv_list: Sequence[str] | None = None,
+        mv_list: Sequence[str] | None = None,
+        max_points: int | None = 2_000,
+        show_messages: bool = True,
+    ):
+        """Факт vs open-loop на выбранном диапазоне.
+
+        Параметры ``start_pos``/``end_pos`` задают полуинтервал
+        ``[start_pos : end_pos)`` (правый конец не включается). Если их
+        не передавать, по умолчанию берутся последние ``max_points`` точек —
+        так график остаётся «лёгким» даже на больших кейсах. На графике
+        автоматически показывается зона прогрева и метрики (sMAPE/R²) для
+        каждой CV.
+
+        Чтобы выбрать конкретные переменные:
+
+        * ``cv_list`` — список колонок CV для сравнения факт/прогноз
+          (по умолчанию первые 5);
+        * ``mv_list`` — список MV, отображаемых на отдельном графике
+          (по умолчанию первые 5).
+
+        Если переданных переменных нет в наборе данных, будет выброшено
+        ``ValueError`` — это помогает быстро обнаружить опечатку.
         """
         n = len(self.df)
-        s = 0 if start_pos is None else int(start_pos)
-        e = n if end_pos   is None else int(end_pos)
+        if start_pos is None and end_pos is None and max_points is not None and n > max_points:
+            e = n
+            s = max(0, n - int(max_points))
+            auto_range = True
+        else:
+            s = 0 if start_pos is None else int(start_pos)
+            e = n if end_pos   is None else int(end_pos)
+            auto_range = False
         if not (0 <= s < n) or not (0 < e <= n) or not (s < e):
             raise ValueError(f"Неверный диапазон: start_pos={s}, end_pos={e}, len={n}. "
                              "Должно быть: 0 <= s < e <= len(df).")
+
+        cv_all = list(self.cv_cols)
+        if cv_list is None:
+            cv_to_plot = cv_all[:5]
+            auto_cv = True
+        else:
+            cv_to_plot = [str(cv) for cv in cv_list]
+            missing = [cv for cv in cv_to_plot if cv not in cv_all]
+            if missing:
+                raise ValueError(f"Следующие CV отсутствуют в данных: {missing}")
+            auto_cv = False
+        if not cv_to_plot:
+            raise ValueError("Нет CV для отображения (cv_list пуст).")
+
+        mv_all = list(self.mv_cols)
+        if mv_list is None:
+            mv_to_plot = mv_all[:5]
+            auto_mv = True
+        else:
+            mv_to_plot = [str(mv) for mv in mv_list]
+            missing_mv = [mv for mv in mv_to_plot if mv not in mv_all]
+            if missing_mv:
+                raise ValueError(f"Следующие MV отсутствуют в данных: {missing_mv}")
+            auto_mv = False
 
         dfw = self.df.iloc[s:e]
         zhw = self.openloop_pred.loc[dfw.index]
         L = len(dfw)
         x = np.arange(L)
 
+        messages: list[str] = []
+        if auto_range and show_messages:
+            messages.append(
+                f"Диапазон графика усечён до последних {L} точек. "
+                "Передайте start_pos/end_pos для просмотра другого участка."
+            )
+        if auto_cv and len(cv_all) > len(cv_to_plot) and show_messages:
+            messages.append(
+                "Показаны только первые 5 CV. Передайте cv_list, чтобы указать другой набор."
+            )
+        if auto_mv and len(mv_all) > len(mv_to_plot) and show_messages and mv_to_plot:
+            messages.append(
+                "Показаны только первые 5 MV. Передайте mv_list, чтобы указать другой набор."
+            )
+        if messages:
+            print("\n".join(messages))
+
         warmup_global = int(self.warmup_end_pos)
         warm_len_local = max(0, min(warmup_global, e) - s)
 
-        for cv in self.cv_cols:
+        for cv in cv_to_plot:
             y_pred = zhw[cv].astype(float).copy()
             if warm_len_local > 0:
                 y_pred.iloc[:warm_len_local] = np.nan
@@ -124,13 +314,51 @@ class ForecastResult:
             )
             fig.show()
 
+        if mv_to_plot:
+            fig_mv = go.Figure()
+            for mv in mv_to_plot:
+                fig_mv.add_trace(
+                    go.Scatter(x=x, y=dfw[mv], name=mv, mode="lines", line=dict(width=2))
+                )
+            fig_mv.update_layout(
+                title=f"{title_prefix}: MV  |  [{s}:{e})",
+                xaxis_title="Такт",
+                yaxis_title="MV",
+                width=1100,
+                height=420,
+                legend=dict(orientation="h", x=1, xanchor="right"),
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            fig_mv.show()
+
     # ---------------------- «ВЕЕР» ROLLING ----------------------
-    def plot_rolling(self, start_pos: int | None = None, end_pos: int | None = None,
-                     fan_stride: int = 100, fan_max: int = 20,
-                     title_prefix: str = "Rolling"):
-        """
-        «Веер» rolling на [start_pos : end_pos) (end_pos эксклюзивный).
-        Серая зона прогрева и запрет стартов внутри неё строятся по пересечению окна с [0:warmup_end_pos).
+    def plot_rolling(
+        self,
+        start_pos: int | None = None,
+        end_pos: int | None = None,
+        fan_stride: int = 100,
+        fan_max: int = 20,
+        title_prefix: str = "Rolling",
+        cv_list: Sequence[str] | None = None,
+        mv_list: Sequence[str] | None = None,
+        max_points: int | None = 2_000,
+        show_messages: bool = True,
+    ):
+        """Строит rolling «веер» на выбранном диапазоне.
+
+        Диапазон ``[start_pos : end_pos)`` обрабатывается аналогично
+        :meth:`plot_openloop`. По умолчанию берутся последние ``max_points``
+        наблюдений и максимум 5 CV/MV. Аргументы ``fan_stride`` и ``fan_max``
+        управляют прореживанием стартов rolling: например, ``fan_stride=200``
+        и ``fan_max=10`` оставят каждый 200‑й старт, но не больше 10 штук.
+
+        ``mv_list`` позволяет дополнительно отрисовать интересующие MV на
+        отдельном графике (по умолчанию берутся первые 5), что помогает
+        сопоставить динамику управлений и фактических CV.
+
+        Если в выбранном диапазоне стартов недостаточно (учитывая прогрев и
+        горизонт ``N``), метод бросает ``ValueError`` с подсказкой. Это нормальное
+        поведение для коротких окон данных.
         """
         if not self.rolling_available:
             reason = self.rolling_unavailable_reason or "rolling не рассчитан."
@@ -141,15 +369,62 @@ class ForecastResult:
             raise ValueError("Нельзя построить веер: нет предсказаний для горизонта k=1.")
 
         n = len(self.df)
-        s = 0 if start_pos is None else int(start_pos)
-        e = n if end_pos   is None else int(end_pos)
+        if start_pos is None and end_pos is None and max_points is not None and n > max_points:
+            e = n
+            s = max(0, n - int(max_points))
+            auto_range = True
+        else:
+            s = 0 if start_pos is None else int(start_pos)
+            e = n if end_pos   is None else int(end_pos)
+            auto_range = False
         if not (0 <= s < n) or not (0 < e <= n) or not (s < e):
             raise ValueError(f"Неверный диапазон: start_pos={s}, end_pos={e}, len={n}. "
                              "Должно быть: 0 <= s < e <= len(df).")
 
+        cv_all = list(self.cv_cols)
+        if cv_list is None:
+            cv_to_plot = cv_all[:5]
+            auto_cv = True
+        else:
+            cv_to_plot = [str(cv) for cv in cv_list]
+            missing = [cv for cv in cv_to_plot if cv not in cv_all]
+            if missing:
+                raise ValueError(f"Следующие CV отсутствуют в данных: {missing}")
+            auto_cv = False
+        if not cv_to_plot:
+            raise ValueError("Нет CV для отображения (cv_list пуст).")
+
+        mv_all = list(self.mv_cols)
+        if mv_list is None:
+            mv_to_plot = mv_all[:5]
+            auto_mv = True
+        else:
+            mv_to_plot = [str(mv) for mv in mv_list]
+            missing_mv = [mv for mv in mv_to_plot if mv not in mv_all]
+            if missing_mv:
+                raise ValueError(f"Следующие MV отсутствуют в данных: {missing_mv}")
+            auto_mv = False
+
         dfw = self.df.iloc[s:e]
         L = len(dfw)
         x = np.arange(L)
+
+        messages: list[str] = []
+        if auto_range and show_messages:
+            messages.append(
+                f"Диапазон графика усечён до последних {L} точек. "
+                "Передайте start_pos/end_pos для просмотра другого участка."
+            )
+        if auto_cv and len(cv_all) > len(cv_to_plot) and show_messages:
+            messages.append(
+                "Показаны только первые 5 CV. Передайте cv_list, чтобы указать другой набор."
+            )
+        if auto_mv and len(mv_all) > len(mv_to_plot) and show_messages and mv_to_plot:
+            messages.append(
+                "Показаны только первые 5 MV. Передайте mv_list, чтобы указать другой набор."
+            )
+        if messages:
+            print("\n".join(messages))
 
         warmup_global = int(self.warmup_end_pos)
         warm_len_local = max(0, min(warmup_global, e) - s)
@@ -171,12 +446,39 @@ class ForecastResult:
         if not valid_starts:
             raise ValueError("В выбранном диапазоне нет валидных стартов для веера (учтите прогрев и горизонт N).")
 
-        step = max(1, int(fan_stride))
-        t_starts = valid_starts[::step]
-        if len(t_starts) > fan_max:
-            t_starts = t_starts[:fan_max]
+        valid_starts = sorted(set(int(p) for p in valid_starts))
+        stride = max(1, int(fan_stride))
+        limit = fan_max if fan_max is not None and fan_max > 0 else len(valid_starts)
+        if limit <= 0:
+            limit = len(valid_starts)
+        limit = min(limit, len(valid_starts))
 
-        for cv in self.cv_cols:
+        spaced: list[int] = []
+        for pos in valid_starts:
+            if not spaced or (pos - spaced[-1]) >= stride:
+                spaced.append(pos)
+
+        if not spaced:
+            spaced = [valid_starts[0]]
+
+        if len(spaced) > limit:
+            idx = np.linspace(0, len(spaced) - 1, limit, dtype=int)
+            t_starts = [spaced[i] for i in idx]
+        else:
+            t_starts = spaced
+
+        if show_messages:
+            msg = (
+                f"Веер построен по {len(t_starts)} стартам из {len(valid_starts)} доступных в диапазоне."
+            )
+        if show_messages and len(t_starts) > 1:
+            diffs = np.diff(sorted(t_starts))
+            if len(diffs):
+                msg += f" Минимальный шаг между стартами: {int(diffs.min())}."
+        if show_messages:
+            print(msg, flush=True)
+
+        for cv in cv_to_plot:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=x, y=dfw[cv], name="факт", mode="lines",
                                      line=dict(width=2)))
@@ -212,13 +514,37 @@ class ForecastResult:
             )
             fig.show()
 
+        if mv_to_plot:
+            fig_mv = go.Figure()
+            for mv in mv_to_plot:
+                fig_mv.add_trace(
+                    go.Scatter(x=x, y=dfw[mv], name=mv, mode="lines", line=dict(width=2))
+                )
+            fig_mv.update_layout(
+                title=f"{title_prefix}: MV  |  [{s}:{e})",
+                xaxis_title="Такт",
+                yaxis_title="MV",
+                width=1100,
+                height=420,
+                legend=dict(orientation="h", x=1, xanchor="right"),
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            fig_mv.show()
+
     def summary(self, digits: int = 1, top_n: int = 3, return_text: bool = False) -> str | None:
-        """
-        Печатает (и/или возвращает) краткий отчёт по расчёту:
-        • размеры данных, N и позиция прогрева;
-        • open-loop (one-shot): средний R² и таблица R² по CV;
-        • rolling: статус/причина, средний R², агрегат по CV и (опционально) срез по горизонтам;
-        • топ-CV по R² (лучшие/худшие) для open-loop и rolling.
+        """Текстовая сводка расчёта.
+
+        Метод помогает быстро оценить качество модели, не открывая графики.
+        В отчёте показываются:
+
+        * объём выборки и структура данных (сколько CV/MV);
+        * выбранный горизонт ``N`` и позиция окончания прогрева;
+        * заметки/примечания (например, об усечении датасета или капе ``N``);
+        * агрегированные метрики open-loop и rolling с топ- и худшими CV;
+        * при наличии — усреднённые по горизонту sMAPE/R².
+
+        По умолчанию результат печатается. Если нужно получить строку (например,
+        для логов или тестов), передайте ``return_text=True``.
         """
         import numpy as np
         import pandas as pd
@@ -250,6 +576,14 @@ class ForecastResult:
         lines.append(f"CV: {len(list(self.cv_cols))} | MV: {len(list(self.mv_cols))}")
         lines.append(f"N (глобальный горизонт): {self.N}")
         lines.append(f"Позиция конца прогрева: {self.warmup_end_pos}")
+        if getattr(self, "notes", None):
+            lines.append("Заметки:")
+            for note in self.notes:
+                lines.append(f" • {note}")
+        if getattr(self, "preprocessing", None):
+            lines.append("Предобработка:")
+            for key, value in self.preprocessing.items():
+                lines.append(f" • {key}: {value}")
         lines.append("")
 
         lines.append("--- Open-loop (one-shot) ---")
@@ -330,20 +664,51 @@ class SSComputeParams:
     alpha_bias: float = 1.0
     dt: float = 1.0
     tau_is_steps: bool = True
-    rolling_sample_pct: float = 100.0  # 0..100 — доля тактов, где считаем «веер»/метрики rolling
+    rolling_sample_pct: Optional[float] = None  # None ⇒ подобрать автоматически
     anchor_filter_len: int = 1         # 1 = без фильтра; >1 — MA по факту для якорения
+    max_auto_N: Optional[int] = 200    # ограничение на авто-N при выборе 'max'
 
 
-def _resolve_N(N_all: np.ndarray, N_req) -> int:
+def _resolve_N(N_all: np.ndarray, N_req, max_auto: Optional[int]) -> tuple[int, bool]:
+    capped = False
     if N_req == 'min':
         if N_all.size == 0:
             raise ValueError("N_all пуст; не из чего взять min().")
-        return max(1, int(np.min(N_all)))
+        return max(1, int(np.min(N_all))), capped
     if isinstance(N_req, (int, np.integer)) and N_req > 0:
-        return int(N_req)
+        return int(N_req), capped
     if N_all.size == 0:
         raise ValueError("N_all пуст; не из чего взять max().")
-    return max(1, int(np.max(N_all)))
+    n_val = max(1, int(np.max(N_all)))
+    if max_auto is not None and n_val > int(max_auto):
+        n_val = int(max_auto)
+        capped = True
+    return n_val, capped
+
+
+def _auto_rolling_sample_pct(T: int, n_cv: int, n_mv: int, N: int) -> tuple[float, int]:
+    """Подбор rolling_sample_pct в зависимости от размера задачи."""
+
+    if T <= 0:
+        return 100.0, 0
+
+    # Для коротких рядов считаем каждый такт — метрики тогда построены на всей
+    # длине без дополнительных эвристик.
+    if T <= max(2_000, 5 * max(1, N)):
+        return 100.0, T
+
+    eff_horizon = max(1.0, N / 50.0)
+    eff_cv = max(1.0, n_cv / 4.0)
+    eff_mv = 1.0 + 0.2 * max(0.0, (n_mv / 6.0) - 1.0)
+    complexity = eff_horizon * eff_cv * eff_mv
+
+    # «Бюджет» стартов rolling, который хотим выдерживать даже на крупных
+    # задачах. При N≈200 это эквивалентно ~10 млн прогнозов CV.
+    base_budget = 50_000.0
+    approx_count = int(np.clip(base_budget / max(complexity, 1.0), 100, T))
+
+    pct = float(np.clip(100.0 * approx_count / max(T, 1), 100.0 / T, 100.0))
+    return pct, approx_count
 
 
 def compute_forecast_ss(
@@ -359,19 +724,47 @@ def compute_forecast_ss(
     # проверки входа
     if not isinstance(df, pd.DataFrame) or df.empty:
         raise ValueError("df пуст или не DataFrame.")
-    for c in list(mv_cols) + list(cv_cols):
+
+    mv_cols = list(mv_cols)
+    cv_cols = list(cv_cols)
+    for c in mv_cols + cv_cols:
         if c not in df.columns:
             raise ValueError(f"Колонка '{c}' отсутствует в df.")
 
     df = df.sort_index()
     U = df[mv_cols].to_numpy()
     Z = df[cv_cols].to_numpy()
-    T = len(df); n_cv = len(list(cv_cols))
+    T = len(df)
+    n_cv = len(cv_cols)
+    n_mv = len(mv_cols)
     if T < 3:
         raise ValueError(f"Слишком мало точек: T={T}, нужно ≥ 3.")
 
     N_all = np.asarray(N_all, int)
-    N = _resolve_N(N_all, p.N)
+    N, capped = _resolve_N(N_all, p.N, getattr(p, "max_auto_N", None))
+
+    notes: list[str] = []
+    preprocessing_info: Dict[str, Any] = {}
+    user_messages: list[str] = []
+
+    def _log(msg: str, *, store: bool = True) -> None:
+        """Печатает сообщение сразу и при необходимости сохраняет его."""
+        if store:
+            user_messages.append(msg)
+        print(msg, flush=True)
+
+    _log(
+        f"Исходные данные: T={T} (CV={n_cv}, MV={n_mv})"
+    )
+    horizon_msg = f"Выбранный горизонт N: {N}"
+    if capped:
+        max_auto = getattr(p, "max_auto_N", None)
+        cap_note = (
+            f"Горизонт N ограничен до {N} из-за max_auto_N={max_auto}."
+        )
+        notes.append(cap_note)
+        horizon_msg += f" (ограничен max_auto_N={max_auto})"
+    _log(horizon_msg)
 
     # ── создаём единый предиктор (будем из него «доставать» open-loop)
     pred = PredictSSRolling(W=W, N_all=N_all, dt=p.dt,
@@ -386,6 +779,15 @@ def compute_forecast_ss(
                          u_past=None, warmup_len=None, assume_steady=not p.use_history)
 
     warmup_end_pos = N if (p.use_history and T > N) else 0
+    if p.use_history and T > N:
+        _log(
+            f"Прогрев по факту включён: warmup_end_pos={warmup_end_pos}."
+        )
+    else:
+        status = "включён" if p.use_history else "отключён"
+        _log(
+            f"Прогрев по факту {status}; warmup_end_pos={warmup_end_pos}."
+        )
 
     # warmup по факту — тоже через фильтрованный факт
     if p.use_history and T > N:
@@ -411,9 +813,65 @@ def compute_forecast_ss(
         rolling_reason = f"rolling невозможен: длина окна T={T} ≤ N={N}. Уменьшите N или расширьте окно данных."
 
     # прореживание
-    pct = float(np.clip(p.rolling_sample_pct, 0.0, 100.0))
+    pct_raw = getattr(p, "rolling_sample_pct", None)
+    if isinstance(pct_raw, str):
+        if pct_raw.strip().lower() == "auto":
+            pct_raw = None
+        else:
+            raise ValueError("rolling_sample_pct должен быть числом, None или 'auto'.")
+
+    approx_count = 0
+    pct_source = "manual"
+    if pct_raw is None:
+        pct, approx_count = _auto_rolling_sample_pct(T=T, n_cv=n_cv, n_mv=n_mv, N=N)
+        pct_source = "auto"
+    else:
+        pct = float(np.clip(pct_raw, 0.0, 100.0))
+        approx_count = int(T if pct >= 99.5 else max(1, round(T * pct / 100.0))) if pct > 0 else 1
+
+    pct = float(np.clip(pct, 0.0, 100.0))
     take_all = pct >= 99.5
     step = 1 if take_all else max(1, int(round(100.0 / max(pct, 1e-9))))
+
+    approx_step = 1 if take_all else max(1, int(round(T / max(approx_count, 1))))
+
+    sampling_details = {
+        "mode": pct_source,
+        "pct": pct,
+        "approx_starts": int(approx_count),
+        "approx_step": int(approx_step),
+    }
+    if pct_source == "auto":
+        sampling_details.update({
+            "T": int(T),
+            "n_cv": int(n_cv),
+            "n_mv": int(n_mv),
+            "N": int(N),
+        })
+        auto_msg = (
+            "rolling_sample_pct автоматически подобран: "
+            f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step}). "
+            f"Параметры задачи: CV={n_cv}, MV={n_mv}, N={N}."
+        )
+        notes.append(auto_msg)
+        _log(
+            f"rolling_sample_pct (auto): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
+        )
+    elif pct < 99.5:
+        manual_msg = (
+            "rolling_sample_pct задан вручную: "
+            f"≈{pct:.3f}% (≈{approx_count} стартов из {T}, шаг ≈ {approx_step})."
+        )
+        notes.append(manual_msg)
+        _log(
+            f"rolling_sample_pct (manual): ≈{pct:.3f}% (≈{approx_count} стартов, шаг≈{approx_step})."
+        )
+    else:
+        _log(
+            "rolling_sample_pct: 100% (rolling на каждом такте)."
+        )
+
+    preprocessing_info["rolling_sampling"] = sampling_details
 
     rolling_pred_by_horizon: Dict[int, pd.DataFrame] = {}
     rolling_metrics_per_horizon = pd.DataFrame(columns=["sMAPE_%", "R2_%"])
@@ -455,6 +913,26 @@ def compute_forecast_ss(
         iter_idx += 1
 
     # упаковываем rolling предсказания по горизонтам
+    sampling_details["actual_starts"] = int(len(sampled_t))
+    if rolling_available:
+        if sampled_t:
+            _log(
+                f"Rolling стартов рассчитано: {len(sampled_t)} (макс. t для rolling: {t_last})."
+            )
+        else:
+            _log(
+                "Rolling доступен, но подходящих стартов не найдено (проверьте warmup/N)."
+            )
+    else:
+        reason_text = rolling_reason or "без указания причины"
+        _log(f"Rolling отключён: {reason_text}")
+
+    if not rolling_available:
+        sampling_details["status"] = "unavailable"
+        sampling_details["reason"] = reason_text
+    else:
+        sampling_details["status"] = "available"
+
     if rolling_available:
         for k in range(1, N+1):
             mask = np.isfinite(preds_by_k[k]).all(axis=1)
@@ -470,6 +948,10 @@ def compute_forecast_ss(
     df_eval = df.iloc[eval_from:]
     zhat_eval = openloop_pred.iloc[eval_from:]
 
+    _log(
+        f"→ Считаем метрики open-loop на {len(df_eval)} точках (начиная с t={eval_from})."
+    )
+
     rows = []
     for cv in cv_cols:
         sm, r2 = _compute_smape_r2(df_eval[cv].to_numpy(), zhat_eval[cv].to_numpy())
@@ -477,8 +959,20 @@ def compute_forecast_ss(
     openloop_metrics_overall = pd.DataFrame(rows).set_index("cv") if rows else pd.DataFrame()
     openloop_R2_mean = float(openloop_metrics_overall["R2_%"].mean()) if not openloop_metrics_overall.empty else np.nan
 
+    if openloop_metrics_overall.empty:
+        _log("Метрики open-loop: недостаточно точек после прогрева для расчёта.")
+    else:
+        _log(
+            "Метрики open-loop рассчитаны: "
+            f"средний R² ≈ {openloop_R2_mean:.2f}% по {len(openloop_metrics_overall)} CV."
+        )
+
     # ── метрики rolling: по sampled_t (тоже по сырому факту)
     if rolling_available and sampled_t:
+        _log(
+            "→ Считаем метрики rolling: "
+            f"{len(sampled_t)} стартов, горизонтов={N}."
+        )
         metrics_rows = []
         t_idx = np.array(sampled_t, dtype=int)
         for k in range(1, N+1):
@@ -507,10 +1001,25 @@ def compute_forecast_ss(
             rolling_metrics_overall = pd.DataFrame(overall_rows).set_index("cv")
             rolling_R2_mean = float(rolling_metrics_overall["R2_%"].mean())
 
+        if rolling_metrics_overall.empty:
+            _log("Метрики rolling: подходящих точек не набралось (проверьте горизонты/NaN).")
+        else:
+            _log(
+                "Метрики rolling рассчитаны: "
+                f"средний R² ≈ {rolling_R2_mean:.2f}% по {len(rolling_metrics_overall)} CV."
+            )
+    elif rolling_available and not sampled_t:
+        _log("Метрики rolling не считались: нет стартов в выборке.")
+
+    if notes:
+        for note in notes:
+            if note not in user_messages:
+                _log(note)
+
     return ForecastResult(
         df=df,
-        mv_cols=list(mv_cols),
-        cv_cols=list(cv_cols),
+        mv_cols=mv_cols,
+        cv_cols=cv_cols,
         openloop_pred=openloop_pred,
         openloop_metrics_overall=openloop_metrics_overall,
         openloop_R2_mean=openloop_R2_mean,
@@ -521,5 +1030,7 @@ def compute_forecast_ss(
         N=N,
         warmup_end_pos=warmup_end_pos,
         rolling_available=rolling_available,
-        rolling_unavailable_reason=rolling_reason
+        rolling_unavailable_reason=rolling_reason,
+        notes=notes,
+        preprocessing=preprocessing_info,
     )
